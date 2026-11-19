@@ -1,0 +1,20 @@
+# 水质实验室批次修订发布台：单容器 + 两个独立卷。
+# wq-data 与 wq-downstream 是不同挂载点，游离文件隔离按内容复制完成，
+# 跨挂载场景（正是本修复针对的场景）在 compose 下即为默认部署形态。
+services:
+  wq-publish:
+    build: .
+    image: wq-publish
+    ports:
+      - "5000:5000"
+    environment:
+      WQ_DATA_DIR: /data
+      WQ_DOWNSTREAM_DIR: /downstream
+    volumes:
+      - wq-data:/data
+      - wq-downstream:/downstream
+    restart: unless-stopped
+
+volumes:
+  wq-data:
+  wq-downstream:

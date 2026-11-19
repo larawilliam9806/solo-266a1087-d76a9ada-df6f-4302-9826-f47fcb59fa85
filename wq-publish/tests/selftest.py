@@ -6,7 +6,10 @@
 3. 并发：两个页面从同一版本发起，仅一个发布成功，另一个 409 须重新预览
 4. 崩溃恢复：文件缺失、文件被改坏、遗留临时文件、游离文件、改名后未提交
 5. 撤回语义：整批替换后旧行消失；会话取消/重复发布防护
+6. 游离文件隔离：跨挂载复制、同秒同名独立留存、复制失败原件保留且
+   下次启动继续处理、半成品清理、恢复日志可定位隔离件
 """
+import errno
 import hashlib
 import io
 import os
@@ -207,6 +210,107 @@ check("取消后发布被拒绝（409 且会话 cancelled）",
       and app.storage.get_session(tok)["status"] == "cancelled")
 check("取消不影响当前版本",
       app.storage.current_registry()["current_version"] == v_before)
+
+print("== 7. 游离文件隔离：跨挂载、同秒同名、失败续处理 ==")
+qdir = os.path.join(data_dir, "quarantine")
+
+# 7a 数据目录与下游目录位于不同挂载：跨目录 rename 一律抛 EXDEV
+real_replace = os.replace
+
+
+def _exdev_replace(src, dst):
+    if os.path.dirname(os.path.abspath(src)) != os.path.dirname(os.path.abspath(dst)):
+        raise OSError(errno.EXDEV, "Invalid cross-device link", src)
+    return real_replace(src, dst)
+
+
+stray_cross = os.path.join(down_dir, "stray_cross.csv")
+with open(stray_cross, "wb") as fh:
+    fh.write(b"cross-device-content")
+os.replace = _exdev_replace
+try:
+    create_app(data_dir=data_dir, downstream_dir=down_dir)  # 不应因 EXDEV 崩溃
+finally:
+    os.replace = real_replace
+copies = [f for f in os.listdir(qdir) if f.endswith("stray_cross.csv")]
+check("7a 跨挂载时游离文件仍可隔离（复制而非跨设备改名）",
+      not os.path.exists(stray_cross) and len(copies) == 1, str(copies))
+check("7a 隔离件内容完整",
+      len(copies) == 1
+      and open(os.path.join(qdir, copies[0]), "rb").read() == b"cross-device-content")
+
+# 7b 同一秒隔离同名文件：每份原件独立留存，互不覆盖
+for i in (1, 2):
+    with open(os.path.join(down_dir, "dup.csv"), "wb") as fh:
+        fh.write(f"dup-content-{i}".encode())
+    create_app(data_dir=data_dir, downstream_dir=down_dir)
+dups = sorted(f for f in os.listdir(qdir) if f.endswith("dup.csv"))
+check("7b 同秒同名游离文件各自独立留存", len(dups) == 2, str(dups))
+contents = sorted(open(os.path.join(qdir, f), "rb").read() for f in dups)
+check("7b 两份隔离件内容完整、未互相覆盖",
+      contents == [b"dup-content-1", b"dup-content-2"], str(contents))
+
+# 7c 隔离复制失败：原件保留、启动不崩、日志如实、不留半成品、下次启动继续处理
+stray_fragile = os.path.join(down_dir, "fragile.csv")
+with open(stray_fragile, "wb") as fh:
+    fh.write(b"keep-me")
+real_copy = shutil.copyfileobj
+
+
+def _boom_copy(*args, **kwargs):
+    raise OSError("No space left on device (simulated)")
+
+
+shutil.copyfileobj = _boom_copy
+startup_ok = True
+try:
+    app_fragile = create_app(data_dir=data_dir, downstream_dir=down_dir)
+except Exception:
+    startup_ok = False
+finally:
+    shutil.copyfileobj = real_copy
+check("7c 隔离复制失败不阻碍网页启动", startup_ok)
+check("7c 原件未完整留存前不被删除",
+      os.path.exists(stray_fragile)
+      and open(stray_fragile, "rb").read() == b"keep-me")
+check("7c 半成品不作为完整隔离件残留",
+      not [f for f in os.listdir(qdir) if f.startswith(".tmp-quarantine-")])
+frag_events = ([e for e in app_fragile.storage.recent_events(50)
+                if "fragile.csv" in e["detail"]] if startup_ok else [])
+check("7c 失败如实记录、不谎报已隔离",
+      frag_events and "隔离失败" in frag_events[0]["detail"]
+      and "已完整隔离" not in frag_events[0]["detail"],
+      frag_events[0]["detail"] if frag_events else "无日志")
+create_app(data_dir=data_dir, downstream_dir=down_dir)
+check("7c 故障恢复后再次启动继续处理并成功隔离",
+      not os.path.exists(stray_fragile)
+      and any(f.endswith("fragile.csv") for f in os.listdir(qdir)))
+
+# 7d 上次中断留下的隔离半成品：启动时清理，且不被当成完整隔离件
+half = os.path.join(qdir, ".tmp-quarantine-half")
+with open(half, "wb") as fh:
+    fh.write(b"partial")
+create_app(data_dir=data_dir, downstream_dir=down_dir)
+check("7d 未完成的隔离半成品被清理", not os.path.exists(half))
+
+# 7e 恢复日志可定位到对应隔离件
+stray_log = os.path.join(down_dir, "logme.csv")
+with open(stray_log, "wb") as fh:
+    fh.write(b"log-me")
+app_log = create_app(data_dir=data_dir, downstream_dir=down_dir)
+log_events = [e for e in app_log.storage.recent_events(50)
+              if e["kind"] == "recover" and "logme.csv" in e["detail"]
+              and "已完整隔离" in e["detail"]]
+m = re.search(r"quarantine/(\S+)", log_events[0]["detail"]) if log_events else None
+check("7e 恢复日志记录隔离件名且文件确实存在",
+      m is not None and os.path.exists(os.path.join(qdir, m.group(1))),
+      log_events[0]["detail"] if log_events else "无日志")
+
+# 7f 正式 CSV 仍按版本登记恢复并可供下游读取（上述隔离操作不影响正式文件）
+reg = app_log.storage.current_registry()
+check("7f 正式 CSV 与登记版本一致、可正常读取",
+      open(live, "rb").read()
+      and hashlib.sha256(open(live, "rb").read()).hexdigest() == reg["content_hash"])
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")

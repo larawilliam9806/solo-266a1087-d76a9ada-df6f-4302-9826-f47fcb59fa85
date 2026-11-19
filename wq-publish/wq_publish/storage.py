@@ -8,12 +8,16 @@
   最后提交事务登记新版本。
 * 提交后进程若在改名完成前崩溃：重启时按数据库登记重新生成 CSV，
   并清理遗留临时文件；登记里不存在的游离文件会被移入 quarantine 隔离。
+* 隔离采用「复制 → fsync → 同目录原子改名 → 删除原件」：数据目录与下游
+  目录跨挂载也能工作；隔离件名带随机后缀，同秒同名文件各自独立留存；
+  复制失败或进程中断时原件保留，下次启动继续处理。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -122,13 +126,29 @@ class Storage:
                     actions.append(msg)
                     self._log(conn, "recover", msg)
 
+            # 1b) 清理隔离区里未完成的半成品：上次隔离复制被中断时可能残留，
+            #     半成品绝不能被当成完整隔离件，清理后本次启动重新隔离原件
+            for name in os.listdir(self.quarantine_dir):
+                if name.startswith(".tmp-quarantine-"):
+                    path = os.path.join(self.quarantine_dir, name)
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    msg = f"清理未完成的隔离临时文件 quarantine/{name}"
+                    actions.append(msg)
+                    self._log(conn, "recover", msg)
+
             # 2) 登记为空：正式文件（若存在）属于无登记游离文件，隔离并保留
             if reg is None:
                 if os.path.exists(self.live_path):
-                    dest = self._quarantine(LIVE_FILENAME)
-                    msg = f"数据库无任何发布登记，将下游游离文件移入 {os.path.basename(dest)}"
-                    actions.append(msg)
-                    self._log(conn, "recover", msg)
+                    actions.append(
+                        self._try_quarantine(
+                            conn,
+                            LIVE_FILENAME,
+                            "数据库无任何发布登记，下游正式文件属于游离文件",
+                        )
+                    )
                 return actions
 
             expected_csv = self._render_version(conn, reg["current_version"])
@@ -160,10 +180,11 @@ class Storage:
             for name in os.listdir(self.downstream_dir):
                 full = os.path.join(self.downstream_dir, name)
                 if os.path.isfile(full) and name != LIVE_FILENAME:
-                    dest = self._quarantine(name)
-                    msg = f"下游目录存在未登记文件 {name}，已移入 {os.path.basename(dest)}"
-                    actions.append(msg)
-                    self._log(conn, "recover", msg)
+                    actions.append(
+                        self._try_quarantine(
+                            conn, name, f"下游目录存在未登记文件 {name}"
+                        )
+                    )
 
             # 5) 超过 24 小时仍未确认的预览会话作废，避免无限期堆积
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(
@@ -185,10 +206,71 @@ class Storage:
                 )
         return actions
 
+    def _try_quarantine(self, conn: sqlite3.Connection, name: str,
+                        context: str) -> str:
+        """隔离一个游离文件并写入恢复日志，返回恢复动作说明。
+
+        隔离失败（如隔离区不可写、磁盘已满）时原件保留在下游目录、
+        日志如实记录失败原因，绝不谎报已隔离；不中断本次恢复与网页启动，
+        下次启动会对仍存在的原件继续处理。
+        """
+        try:
+            dest = self._quarantine(name)
+        except OSError as exc:
+            msg = (
+                f"{context}：隔离失败（{exc}），"
+                "原件保留在下游目录，下次启动将继续处理"
+            )
+            self._log(conn, "recover", msg)
+            return msg
+        msg = f"{context}：已完整隔离为 quarantine/{os.path.basename(dest)}"
+        self._log(conn, "recover", msg)
+        return msg
+
     def _quarantine(self, name: str) -> str:
+        """把下游目录中的游离文件完整留存到隔离区之后，才删除原件。
+
+        * 数据目录与下游目录可能位于不同挂载，跨设备 rename 会直接失败，
+          因此先按内容复制、确认完整留存后再删除原件；
+        * 隔离件文件名 = 时间戳 + 随机后缀 + 原名，同一秒隔离同名文件
+          也各自独立留存，绝不互相覆盖；
+        * 先写隔离区临时文件并 fsync，再同目录原子改名为正式隔离件，
+          最后才删除原件：复制失败或进程中断时原件仍在，半成品只会以
+          ``.tmp-quarantine-*`` 形式残留，不会被当成完整隔离件。
+        """
+        src = os.path.join(self.downstream_dir, name)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        dest = os.path.join(self.quarantine_dir, f"{stamp}-{name}")
-        os.replace(os.path.join(self.downstream_dir, name), dest)
+        while True:
+            dest = os.path.join(
+                self.quarantine_dir, f"{stamp}-{uuid.uuid4().hex[:8]}-{name}"
+            )
+            if not os.path.exists(dest):
+                break
+        tmp_path = os.path.join(
+            self.quarantine_dir, f".tmp-quarantine-{uuid.uuid4().hex}"
+        )
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            with os.fdopen(fd, "wb") as dst_fh, open(src, "rb") as src_fh:
+                shutil.copyfileobj(src_fh, dst_fh)
+                dst_fh.flush()
+                os.fsync(dst_fh.fileno())
+            # 同目录原子改名：隔离件在此刻才以完整内容生效
+            os.replace(tmp_path, dest)
+            self._fsync_dir(self.quarantine_dir)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        # 隔离件已完整落盘，才允许删除原件
+        try:
+            os.unlink(src)
+        except OSError as exc:
+            raise OSError(
+                f"原件删除失败（隔离件 {os.path.basename(dest)} 已完整生成）：{exc}"
+            ) from exc
         return dest
 
     def _atomic_write(self, csv_text: str) -> None:

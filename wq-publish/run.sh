@@ -14,7 +14,7 @@ subprocess.check_call([".venv/bin/python", str(p)])
 p.unlink()
 PY
   fi
-  .venv/bin/pip install -q flask
+  .venv/bin/pip install -q -r requirements.txt
 fi
 
 export WQ_DATA_DIR="${WQ_DATA_DIR:-$PWD/data}"

@@ -20,11 +20,11 @@ CSV、填写批次号，系统逐行校验后预览**新增 / 修改 / 撤回（
 
 ## 本地启动
 
-环境要求：Python 3.10+（仅依赖 Flask）。
+环境要求：Python 3.10+（运行依赖见 `requirements.txt`：Flask；waitress 供容器部署使用）。
 
 ```bash
 cd wq-publish
-./run.sh                 # 自动创建 .venv、安装 flask，监听 http://127.0.0.1:5000
+./run.sh                 # 自动创建 .venv、安装依赖，监听 http://127.0.0.1:5000
 ```
 
 手动方式：
@@ -45,6 +45,20 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 | `WQ_DOWNSTREAM_DIR` | `./downstream` | 下游采集程序读取目录，正式文件固定名为 `published_results.csv` |
 
 下游采集程序只需固定读取 `WQ_DOWNSTREAM_DIR/published_results.csv`。
+
+## Docker Compose 启动
+
+仓库附带 `Dockerfile` 与 `docker-compose.yml`：
+
+```bash
+cd wq-publish
+docker compose up --build
+```
+
+服务监听 `http://127.0.0.1:5000`（容器内由 waitress 提供 WSGI 服务）。
+compose 为数据目录与下游目录分别挂载两个独立卷（`wq-data`、`wq-downstream`），
+二者位于**不同挂载点**——游离文件隔离按内容复制而非跨设备改名，
+跨挂载场景（曾导致旧版本无法启动）在 compose 下即为默认部署形态。
 
 ## 操作流程
 
@@ -68,12 +82,17 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 - SQLite（`data/wq_publish.db`）是版本登记与全版本结果的唯一真相源，
   发布在 `BEGIN IMMEDIATE` 事务内完成「原子换文件 → 写新版本结果 → 更新登记表」。
 - 每次启动（`Storage.recover()`）自动核对并修复：
-  1. 清理崩溃遗留的 `.tmp-publish-*` 临时文件；
+  1. 清理崩溃遗留的 `.tmp-publish-*` 临时文件与隔离区 `.tmp-quarantine-*` 半成品；
   2. 正式文件缺失或 SHA256 与登记不符时，以数据库登记为准原子重建；
   3. 「文件已改名但事务未提交」的现场，重启后回滚为登记中的完整版本；
-  4. 下游目录中未登记的游离文件移入 `data/quarantine/` 隔离（不直接删除）；
+  4. 下游目录中未登记的游离文件隔离到 `data/quarantine/`（不直接删除）：
+     先在隔离区写临时文件并 `fsync`，同目录原子改名为
+     「时间戳+随机后缀+原名」的隔离件，确认完整留存后才删除原件——
+     数据目录与下游目录跨挂载也能工作，同一秒隔离同名文件也各自独立
+     留存、互不覆盖；复制失败或进程中断时原件保留、日志如实记录失败
+     （绝不谎报已隔离），下次启动自动继续处理；
   5. 超过 24 小时未确认的预览会话自动作废。
-  所有恢复动作写入 `event_log` 并展示在首页。
+  所有恢复动作写入 `event_log` 并展示在首页，隔离日志含隔离件文件名可直接定位。
 
 **两个页面从同一版本发起修订，只允许一个成功**
 
@@ -89,9 +108,10 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 .venv/bin/python -I tests/selftest.py
 ```
 
-覆盖 42 项断言：CSV 各类非法输入、上传→预览→发布全链路、增改删分类与撤回语义、
+覆盖 54 项断言：CSV 各类非法输入、上传→预览→发布全链路、增改删分类与撤回语义、
 同版本双页面并发冲突（409 + obsolete + 重新预览成功）、文件缺失/损坏/临时文件/
-游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护。
+游离文件/改名未提交五类崩溃恢复、会话取消与重复发布防护，以及游离文件隔离的
+跨挂载复制、同秒同名独立留存、复制失败原件保留与续处理、半成品清理、日志定位。
 
 `examples/` 下提供 `batch_v1.csv`、`batch_v2_revision.csv`（含增改删）与
 `batch_invalid.csv`（含重复、负数、空值）可直接在页面上演练。
@@ -99,9 +119,10 @@ WQ_DATA_DIR=$PWD/data WQ_DOWNSTREAM_DIR=$PWD/downstream \
 ## 部署提示与已知限制
 
 - `flask run` 为开发服务器；正式环境建议用 `waitress-serve --host 127.0.0.1
-  --port 5000 wsgi:create_app`（或 gunicorn 单实例多线程）。并发正确性依赖
-  SQLite 的 `BEGIN IMMEDIATE` 文件锁与同目录 `os.replace`，多 worker 部署时
-  必须共享同一个 `WQ_DATA_DIR` 与 `WQ_DOWNSTREAM_DIR`。
+  --port 5000 --call wsgi:create_app`（或 gunicorn 单实例多线程，Docker 镜像
+  即采用 waitress）。并发正确性依赖 SQLite 的 `BEGIN IMMEDIATE` 文件锁与
+  同目录 `os.replace`，多 worker 部署时必须共享同一个 `WQ_DATA_DIR` 与
+  `WQ_DOWNSTREAM_DIR`。
 - 全量结果按版本保留在 `results` 表中，当前未提供历史版本回滚的页面入口
   （数据具备，可后续增加）；历史 CSV 文件本身只保留最新一版。
 - 上传上限 16MB；认证、权限控制未包含在本版本内，建议仅监听内网或前置反向代理
